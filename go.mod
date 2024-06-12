@@ -1,4 +1,4 @@
-module github.com/hjwlsy/frame
+module github.com/zhimaAi/go_tools
 
 go 1.22.4
 

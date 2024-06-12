@@ -3,7 +3,7 @@ package msql
 import (
 	"strings"
 
-	"github.com/hjwlsy/frame/tool"
+	"github.com/zhimaAi/go_tools/tool"
 )
 
 func TrimAdd(a ...string) (s string) {

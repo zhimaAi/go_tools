@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjwlsy/frame/logs"
 	"github.com/nsqio/go-nsq"
+	"github.com/zhimaAi/go_tools/logs"
 )
 
 const nsqDefaultHost = `127.0.0.1`

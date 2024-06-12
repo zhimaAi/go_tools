@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hjwlsy/frame/tool"
+	"github.com/zhimaAi/go_tools/tool"
 )
 
 func Model(table string, name ...string) *db {

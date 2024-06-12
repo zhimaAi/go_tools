@@ -4,8 +4,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/hjwlsy/frame/tool"
 	"github.com/nsqio/go-nsq"
+	"github.com/zhimaAi/go_tools/tool"
 )
 
 type PConfig struct {

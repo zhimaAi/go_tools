@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjwlsy/frame/tool"
+	"github.com/zhimaAi/go_tools/tool"
 )
 
 var (
