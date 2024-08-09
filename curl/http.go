@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"encoding/xml"
-	"gopkg.in/yaml.v2"
 	"io"
 	"log"
 	"mime/multipart"
@@ -19,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v2"
 )
 
 var defaultSetting = Setting{
@@ -371,10 +372,16 @@ func (b *Request) DoRequest() (resp *http.Response, err error) {
 	trans := b.setting.Transport
 	if trans == nil {
 		trans = &http.Transport{
-			TLSClientConfig:     b.setting.TLSClientConfig,
-			Proxy:               b.setting.Proxy,
-			MaxIdleConnsPerHost: 100,
-			DisableKeepAlives:   true,
+			DialContext: (&net.Dialer{
+				Timeout:   b.setting.ConnectTimeout,
+				KeepAlive: b.setting.ConnectTimeout + b.setting.ReadWriteTimeout,
+			}).DialContext,
+			TLSClientConfig:       b.setting.TLSClientConfig,
+			Proxy:                 b.setting.Proxy,
+			MaxIdleConnsPerHost:   100,
+			DisableKeepAlives:     true,
+			ResponseHeaderTimeout: b.setting.ReadWriteTimeout,
+			TLSHandshakeTimeout:   b.setting.ConnectTimeout,
 		}
 	} else {
 		if t, ok := trans.(*http.Transport); ok {
@@ -396,6 +403,7 @@ func (b *Request) DoRequest() (resp *http.Response, err error) {
 	client := &http.Client{
 		Transport: trans,
 		Jar:       jar,
+		Timeout:   b.setting.ReadWriteTimeout,
 	}
 	if b.setting.UserAgent != "" && b.req.Header.Get("User-Agent") == "" {
 		b.req.Header.Set("User-Agent", b.setting.UserAgent)
