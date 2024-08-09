@@ -74,17 +74,13 @@ func AppendFile(filename string, data string) error {
 	if !IsFile(filename) {
 		return WriteFile(filename, data)
 	}
-	f, err := os.OpenFile(filename, os.O_WRONLY, 0644)
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
 	}
 	defer func(f *os.File) {
 		_ = f.Close()
 	}(f)
-	n, err2 := f.Seek(0, 2)
-	if err2 != nil {
-		return err2
-	}
-	_, err = f.WriteAt(String2Bytes(data), n)
+	_, err = f.WriteString(data)
 	return err
 }
