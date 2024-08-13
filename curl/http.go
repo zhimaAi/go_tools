@@ -239,10 +239,16 @@ func (b *Request) Body(data interface{}) *Request {
 		bf := bytes.NewBufferString(t)
 		b.req.Body = io.NopCloser(bf)
 		b.req.ContentLength = int64(len(t))
+		b.req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewBufferString(t)), nil
+		}
 	case []byte:
 		bf := bytes.NewBuffer(t)
 		b.req.Body = io.NopCloser(bf)
 		b.req.ContentLength = int64(len(t))
+		b.req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(t)), nil
+		}
 	}
 	return b
 }
@@ -255,6 +261,9 @@ func (b *Request) XMLBody(obj interface{}) (*Request, error) {
 		}
 		b.req.Body = io.NopCloser(bytes.NewReader(byts))
 		b.req.ContentLength = int64(len(byts))
+		b.req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(byts)), nil
+		}
 		b.req.Header.Set("Content-Type", "application/xml")
 	}
 	return b, nil
@@ -268,6 +277,9 @@ func (b *Request) YAMLBody(obj interface{}) (*Request, error) {
 		}
 		b.req.Body = io.NopCloser(bytes.NewReader(byts))
 		b.req.ContentLength = int64(len(byts))
+		b.req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(byts)), nil
+		}
 		b.req.Header.Set("Content-Type", "application/x+yaml")
 	}
 	return b, nil
@@ -281,6 +293,9 @@ func (b *Request) JSONBody(obj interface{}) (*Request, error) {
 		}
 		b.req.Body = io.NopCloser(bytes.NewReader(byts))
 		b.req.ContentLength = int64(len(byts))
+		b.req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(byts)), nil
+		}
 		b.req.Header.Set("Content-Type", "application/json")
 	}
 	return b, nil
