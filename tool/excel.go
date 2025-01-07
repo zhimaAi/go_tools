@@ -25,6 +25,10 @@ func ExcelColumn(row, line int) string {
 }
 
 func ExcelExport(data []map[string]interface{}, fields Fields, title string) (file, name string, err error) {
+	return ExcelExportPro(data, fields, title, `static/uploads/temp`)
+}
+
+func ExcelExportPro(data []map[string]interface{}, fields Fields, title, filePath string) (file, name string, err error) {
 	if title == "" {
 		title = "Excel数据导出"
 	}
@@ -42,7 +46,7 @@ func ExcelExport(data []map[string]interface{}, fields Fields, title string) (fi
 		}
 	}
 	md := MD5(title + Int64ToString(time.Now().UnixNano()) + Random(10))
-	filename := "static/uploads/temp/" + md[:2] + "/" + md[2:] + ".xlsx"
+	filename := filePath + "/" + md[:2] + "/" + md[2:] + ".xlsx"
 	if err = MkDirAll(DirName(filename)); err != nil {
 		return "", "", err
 	}

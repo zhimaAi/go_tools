@@ -16,6 +16,15 @@ func String2IntArray(ids string) []int {
 	return arr
 }
 
+func InArray[Val comparable](a Val, b []Val) bool {
+	for i := range b {
+		if b[i] == a {
+			return true
+		}
+	}
+	return false
+}
+
 func InArrayInt(n int, h []int) bool {
 	for _, v := range h {
 		if v == n {

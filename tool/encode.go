@@ -136,6 +136,11 @@ func JsonEncode(v interface{}) (string, error) {
 	}
 }
 
+func JsonEncodeNoError(v any) string {
+	s, _ := JsonEncode(v)
+	return s
+}
+
 func JsonEncodeIndent(v interface{}, prefix, indent string) (string, error) {
 	if bytes, err := json.MarshalIndent(v, prefix, indent); err != nil {
 		return "", err
@@ -155,4 +160,9 @@ func Base64Decode(src string) (string, error) {
 	} else {
 		return Bytes2String(ret), nil
 	}
+}
+
+func Base64DecodeNoError(src string) string {
+	s, _ := Base64Decode(src)
+	return s
 }
