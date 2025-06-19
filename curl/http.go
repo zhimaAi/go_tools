@@ -3,6 +3,7 @@ package curl
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"encoding/xml"
@@ -15,6 +16,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -119,6 +121,11 @@ type Request struct {
 
 func (b *Request) GetRequest() *http.Request {
 	return b.req
+}
+
+func (b *Request) WithContext(ctx context.Context) *Request {
+	b.req = b.req.WithContext(ctx)
+	return b
 }
 
 func (b *Request) Setting(setting Setting) *Request {
@@ -228,7 +235,7 @@ func (b *Request) PostFile(formname, filename string, argv ...string) *Request {
 	if len(argv) > 0 && len(argv[0]) > 0 {
 		b.filename[formname] = argv[0]
 	} else {
-		b.filename[formname] = filename
+		b.filename[formname] = filepath.Base(filename)
 	}
 	return b
 }
