@@ -4,9 +4,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
+
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
-	"time"
 )
 
 type Params map[string]string
@@ -132,6 +133,17 @@ func SetDebug(name string, dev bool) error {
 		return nil
 	} else {
 		return errors.New("the database alias does not exist")
+	}
+}
+
+func GetDB(name string) (*sql.DB, error) {
+	if name == "" {
+		name = "default"
+	}
+	if alias, ok := dataBases[name]; ok {
+		return alias.db, nil
+	} else {
+		return nil, errors.New("the database alias does not exist")
 	}
 }
 
