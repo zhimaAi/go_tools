@@ -133,9 +133,10 @@ func doWork(handle *ProducerHandle) {
 		//生产data
 		if err = handle.publish(conn, data); err != nil {
 			logs.Error(`producer publish error:%s`, err.Error())
-			//重试一次
+			time.Sleep(time.Second) //重试一次
 			if err = handle.publish(conn, data); err != nil {
 				logs.Error(`producer retry publish error:%s`, err.Error())
+				logs.Error(`producer retry publish error:topic:%s,message:%s,delay:%v`, data.topic, data.message, data.delay)
 				_ = handle.AddJobs(data.topic, data.message, data.delay) //重入jobs
 				conn.Stop()                                              //关闭连接
 				conn = nil                                               //清理连接
