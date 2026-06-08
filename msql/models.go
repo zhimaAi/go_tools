@@ -8,9 +8,12 @@ import (
 	"strings"
 )
 
-// Model 创建一个表模型，用于链式构造和执行 SQL。
+// Model 创建一个 Builder，用于链式构造和执行指定表的 SQL。
 //
 // table 为表名，name 为可选数据库别名；name 为空时使用 default 连接。
+// table 为空或清理后为空时，后续需要表名的查询、写入和表结构检查方法会返回错误。
+//
+// 返回的 Builder 会在链式调用过程中修改自身状态，不应并发复用，也不应在使用后复制。
 //
 // 示例：
 //
@@ -18,19 +21,19 @@ import (
 //	    Where("status", "=", "enabled").
 //	    Order("id desc").
 //	    Select()
-func Model(table string, name ...string) *db {
+func Model(table string, name ...string) *Builder {
 	dbName := DefaultAlias
 	if len(name) > 0 && name[0] != "" {
 		dbName = name[0]
 	}
-	m := &db{table: table, name: dbName}
+	m := &Builder{table: table, name: dbName}
 	return m
 }
 
-// Reset 清空当前模型上的查询条件、字段、排序、分页等临时状态。
+// Reset 清空当前 Builder 上的查询条件、字段、排序、分页等临时状态。
 //
 // Select、Find、Insert、Update、Delete 等执行方法通常会在执行后自动调用 Reset。
-func (m *db) Reset() {
+func (m *Builder) Reset() {
 	m.field = nil
 	m.fieldArgs = nil
 	m.alias = ""
@@ -48,38 +51,10 @@ func (m *db) Reset() {
 	m.offset = 0
 }
 
-// db 保存一次链式 SQL 构造过程中的临时状态。
+// Name 切换当前 Builder 使用的数据库别名。
 //
-// 类型本身不导出，但 Model 会返回 *db，调用方通过其导出方法完成查询和写入。
-type db struct {
-	name        string
-	field       []string
-	fieldArgs   []any
-	table       string
-	alias       string
-	join        []string
-	joinArgs    []any
-	where       []string
-	whereor     []string
-	whereArgs   []any
-	whereorArgs []any
-	group       []string
-	having      []string
-	havingArgs  []any
-	order       []string
-	lastid      int64
-	affect      int64
-	lastsql     string
-	limit       int
-	offset      int
-	istx        bool
-	tx          *sql.Tx
-}
-
-// Name 切换当前模型使用的数据库别名。
-//
-// 如果模型已经开启事务，Name 不会切换连接，避免事务跨连接执行。
-func (m *db) Name(name string) *db {
+// 如果 Builder 已经开启事务，Name 不会切换连接，避免事务跨连接执行。
+func (m *Builder) Name(name string) *Builder {
 	if m.istx || name == "" {
 		return m
 	}
@@ -87,17 +62,40 @@ func (m *db) Name(name string) *db {
 	return m
 }
 
+// Table 修改当前 Builder 的表名。
+//
+// table 为空或清理后为空时不会覆盖原表名；如果 Builder 没有有效表名，
+// 后续需要表名的查询、写入和表结构检查方法会返回错误。
+func (m *Builder) Table(table string) *Builder {
+	if ToField(table) == "" {
+		return m
+	}
+	m.table = table
+	return m
+}
+
+// Alias 设置当前表别名。
+func (m *Builder) Alias(alias string) *Builder {
+	if alias == "" {
+		return m
+	}
+	m.alias = alias
+	return m
+}
+
 // Field 添加 select 字段或表达式。
 //
 // args 用于绑定字段表达式中的占位符，常见于字段子查询。
 // PostgreSQL raw 字段表达式需要使用 $1、$2 等占位符；? 会按 SQL 原文保留。
+// $n 仅表示一个待绑定参数位置，不表示参数复用；每出现一个 $n 就必须按出现顺序传入一个有实际意义的参数。
+// 构造可执行 SQL 时包内会按最终 SQL 出现顺序重新编号这些 PostgreSQL 占位符。
 //
 // 示例：
 //
 //	msql.Model("users").Field("id").Field("name")
 //	msql.Model("users").Field("(select count(*) from orders where user_id=users.id and status=?) order_count", "paid")
 //	msql.Model("users", "pg").Field("(select count(*) from orders where user_id=users.id and status=$1) order_count", "paid")
-func (m *db) Field(field string, args ...any) *db {
+func (m *Builder) Field(field string, args ...any) *Builder {
 	if field == "" {
 		return m
 	}
@@ -109,28 +107,12 @@ func (m *db) Field(field string, args ...any) *db {
 	return m
 }
 
-// Table 修改当前模型的表名。
-func (m *db) Table(table string) *db {
-	if table == "" {
-		return m
-	}
-	m.table = table
-	return m
-}
-
-// Alias 设置当前表别名。
-func (m *db) Alias(alias string) *db {
-	if alias == "" {
-		return m
-	}
-	m.alias = alias
-	return m
-}
-
 // Join 添加 join 子句。
 //
 // cate 为空时默认使用 left；args 用于绑定 join SQL 中的占位符，常见于嵌套子查询。
 // PostgreSQL raw join 片段需要使用 $1、$2 等占位符；? 会按 SQL 原文保留。
+// $n 仅表示一个待绑定参数位置，不表示参数复用；每出现一个 $n 就必须按出现顺序传入一个有实际意义的参数。
+// 构造可执行 SQL 时包内会按最终 SQL 出现顺序重新编号这些 PostgreSQL 占位符。
 //
 // 示例：
 //
@@ -143,7 +125,7 @@ func (m *db) Alias(alias string) *db {
 //	    Join("orders o", "o.user_id=u.id and o.status=$1", "left", "paid").
 //	    Where("u.id", "=", "1").
 //	    BuildSqlPro()
-func (m *db) Join(join, condition, cate string, args ...any) *db {
+func (m *Builder) Join(join, condition, cate string, args ...any) *Builder {
 	if join == "" || condition == "" {
 		return m
 	}
@@ -159,118 +141,8 @@ func (m *db) Join(join, condition, cate string, args ...any) *db {
 	return m
 }
 
-// Where 添加 AND 查询条件。
-//
-// 支持以下常用形式：
-//
-//	Where("id", "1") 等价于 id = ?
-//	Where("id", "=", "1")
-//	Where("status", "in", "open,done")
-//	Where("name", "like", "tom")
-//	Where("age", "between", "18,30")
-//
-// 三段式条件会使用参数绑定；单参数原始 SQL 条件会原样拼接，调用方需保证可信。
-// PostgreSQL 三段式条件由包内自动渲染占位符；单参数原始 SQL 条件不接收绑定参数。
-func (m *db) Where(a ...string) *db {
-	where, args := toWhere(a)
-	if where == "" {
-		return m
-	}
-	if m.where == nil {
-		m.where = []string{}
-	}
-	m.where = append(m.where, where)
-	m.whereArgs = append(m.whereArgs, args...)
-	return m
-}
-
-// WhereIn 添加字段 IN 条件，values 会按绑定参数传递。
-//
-// 适合需要传入非字符串值，或值中可能包含逗号的场景；空 values 不会追加条件。
-//
-// 示例：
-//
-//	msql.Model("users").WhereIn("id", 1, 2, 3)
-//	msql.Model("users").WhereIn("email", "a,b@example.com", "c@example.com")
-func (m *db) WhereIn(field string, values ...any) *db {
-	if field == "" || len(values) == 0 {
-		return m
-	}
-	seats := make([]string, len(values))
-	for i := range values {
-		seats[i] = paramSeat
-	}
-	if m.where == nil {
-		m.where = []string{}
-	}
-	m.where = append(m.where, field+" in("+strings.Join(seats, ",")+")")
-	m.whereArgs = append(m.whereArgs, values...)
-	return m
-}
-
-// WhereBetween 添加字段 BETWEEN 条件，start 和 end 会按绑定参数传递。
-//
-// 示例：
-//
-//	msql.Model("users").WhereBetween("created_at", "2026-06-01", "2026-06-30")
-//	msql.Model("orders").WhereBetween("amount", 100, 500)
-func (m *db) WhereBetween(field string, start, end any) *db {
-	if field == "" {
-		return m
-	}
-	if m.where == nil {
-		m.where = []string{}
-	}
-	m.where = append(m.where, field+" between "+paramSeat+" and "+paramSeat)
-	m.whereArgs = append(m.whereArgs, start, end)
-	return m
-}
-
-// Where2 批量添加 AND 查询条件。
-//
-// 每个子切片的含义与 Where 的参数一致。
-func (m *db) Where2(l [][]string) *db {
-	if l == nil || len(l) == 0 {
-		return m
-	}
-	for _, a := range l {
-		m.Where(a...)
-	}
-	return m
-}
-
-// WhereOr 添加 OR 查询条件。
-//
-// 参数规则与 Where 一致；多个 WhereOr 之间使用 OR 连接。
-// PostgreSQL 三段式条件由包内自动渲染占位符；单参数原始 SQL 条件不接收绑定参数。
-func (m *db) WhereOr(a ...string) *db {
-	whereor, args := toWhere(a)
-	if whereor == "" {
-		return m
-	}
-	if m.whereor == nil {
-		m.whereor = []string{}
-	}
-	m.whereor = append(m.whereor, whereor)
-	m.whereorArgs = append(m.whereorArgs, args...)
-	return m
-}
-
-// WhereOr2 批量添加 OR 查询条件。
-//
-// 每个子切片的含义与 WhereOr 的参数一致。
-func (m *db) WhereOr2(l [][]string) *db {
-	if l == nil || len(l) == 0 {
-		return m
-	}
-	for _, a := range l {
-		m.WhereOr(a...)
-	}
-	return m
-}
-
 // Group 添加 group by 字段或表达式。
-func (m *db) Group(group string) *db {
+func (m *Builder) Group(group string) *Builder {
 	if group == "" {
 		return m
 	}
@@ -281,30 +153,18 @@ func (m *db) Group(group string) *db {
 	return m
 }
 
-// Order 添加 order by 字段或表达式。
-//
-// Order 会原样拼接传入内容，调用方需保证排序字段和方向可信。
-func (m *db) Order(order string) *db {
-	if order == "" {
-		return m
-	}
-	if m.order == nil {
-		m.order = []string{}
-	}
-	m.order = append(m.order, order)
-	return m
-}
-
 // Having 添加 having 条件。
 //
 // args 用于绑定 having 条件中的占位符；having 片段本身会原样拼接，调用方需保证可信。
 // PostgreSQL raw having 片段需要使用 $1、$2 等占位符；? 会按 SQL 原文保留。
+// $n 仅表示一个待绑定参数位置，不表示参数复用；每出现一个 $n 就必须按出现顺序传入一个有实际意义的参数。
+// 构造可执行 SQL 时包内会按最终 SQL 出现顺序重新编号这些 PostgreSQL 占位符。
 //
 // 示例：
 //
 //	total, err := msql.Model("orders").Group("user_id").Having("sum(amount)>?", 100).Count()
 //	total, err = msql.Model("orders", "pg").Group("user_id").Having("sum(amount)>$1", 100).Count()
-func (m *db) Having(having string, args ...any) *db {
+func (m *Builder) Having(having string, args ...any) *Builder {
 	if having == "" {
 		return m
 	}
@@ -316,10 +176,24 @@ func (m *db) Having(having string, args ...any) *db {
 	return m
 }
 
+// Order 添加 order by 字段或表达式。
+//
+// Order 会原样拼接传入内容，调用方需保证排序字段和方向可信。
+func (m *Builder) Order(order string) *Builder {
+	if order == "" {
+		return m
+	}
+	if m.order == nil {
+		m.order = []string{}
+	}
+	m.order = append(m.order, order)
+	return m
+}
+
 // Limit 设置 limit 或 offset + limit。
 //
 // 传一个参数表示 Limit(limit)，传两个参数表示 Limit(offset, limit)。
-func (m *db) Limit(a ...int) *db {
+func (m *Builder) Limit(a ...int) *Builder {
 	if len(a) == 0 {
 		return m
 	}
@@ -336,17 +210,17 @@ func (m *db) Limit(a ...int) *db {
 // GetLastInsertId 返回最近一次 Insert 得到的记录 ID。
 //
 // MySQL 返回数据库生成的自增 ID；PostgreSQL 返回 Insert returning 参数指定的 ID 字段值。
-func (m *db) GetLastInsertId() int64 {
+func (m *Builder) GetLastInsertId() int64 {
 	return m.lastid
 }
 
 // GetRowsAffected 返回最近一次 Update、Update2 或 Delete 影响的行数。
-func (m *db) GetRowsAffected() int64 {
+func (m *Builder) GetRowsAffected() int64 {
 	return m.affect
 }
 
 // GetLastSql 返回最近一次执行的 SQL 调试字符串。
-func (m *db) GetLastSql() string {
+func (m *Builder) GetLastSql() string {
 	return m.lastsql
 }
 
@@ -368,56 +242,35 @@ func GetAsField(field string) string {
 	return normalizeResultField(fields[len(fields)-1])
 }
 
-// ToString 将字符串清理后格式化为 SQL 字符串字面量。
-//
-// 该函数会先复用 ToField 去掉首尾空白和包裹引号，再按 SQL 字符串字面量规则包裹单引号并转义内部单引号。
-func ToString(s string) string {
-	return quoteSQLValueString(ToField(s))
-}
-
-// ToField 清理字段名或表名两侧的空白和引号。
-func ToField(s string) string {
-	return strings.Trim(strings.TrimSpace(s), "`'\"\t ")
-}
-
-// BuildSql 返回带参数渲染结果的调试 SQL 字符串。
-//
-// 该方法只适合日志或调试展示，不建议将返回值作为可执行 SQL 继续传递。
-//
-// Deprecated: 请使用 BuildSqlPro 获取可执行 SQL 和绑定参数。
-func (m *db) BuildSql() string {
-	return renderDebugParamSeats(m.buildSql(), m.getQueryArgs(true))
-}
-
 // BuildSqlPro 返回可执行 SQL 和绑定参数。
+//
+// 如果当前 Builder 没有有效表名，返回空 SQL 和 nil 参数。
 //
 // 示例：
 //
 //	sql, args := msql.Model("users").Where("id", "=", "1").BuildSqlPro()
 //	rows, err := msql.RawValues("", sql, nil, args...)
-func (m *db) BuildSqlPro() (string, []any) {
-	rawQuery := m.buildSql()
+func (m *Builder) BuildSqlPro() (string, []any) {
+	rawQuery, err := m.buildSql()
+	if err != nil {
+		return "", nil
+	}
 	args := m.getQueryArgs(true)
 	return renderParamSeats(m.name, rawQuery, 0), args
 }
 
-// Count 统计当前条件下的记录数。
+// BuildSql 返回带参数渲染结果的调试 SQL 字符串。
 //
-// field 为空时使用 *；存在 group by 时会自动包一层子查询统计分组数量。
-// field 仅接收字段或表达式文本，不支持占位符绑定；Count 也不会使用 Field(..., args...)
-// 中的字段表达式参数。需要绑定条件时请使用 Where、Join 或 Having。
-func (m *db) Count(field ...string) (int, error) {
-	defer m.Reset()
-	if field == nil || len(field) == 0 {
-		field = []string{"*"}
+// 该方法只适合日志或调试展示，不建议将返回值作为可执行 SQL 继续传递。
+// 如果当前 Builder 没有有效表名，返回空字符串。
+//
+// Deprecated: 请使用 BuildSqlPro 获取可执行 SQL 和绑定参数。
+func (m *Builder) BuildSql() string {
+	rawQuery, err := m.buildSql()
+	if err != nil {
+		return ""
 	}
-	rawQuery := m.buildCount(field[0])
-	vs, e := m.queryValues(rawQuery, false)
-	if e != nil || len(vs) < 1 {
-		return 0, e
-	}
-	total, _ := strconv.Atoi(vs[0][`total`])
-	return total, e
+	return renderDebugParamSeats(rawQuery, m.getQueryArgs(true))
 }
 
 // Select 查询多行数据。
@@ -427,9 +280,12 @@ func (m *db) Count(field ...string) (int, error) {
 // 示例：
 //
 //	list, err := msql.Model("users").Where("status", "=", "enabled").Select()
-func (m *db) Select() (list []Params, err error) {
+func (m *Builder) Select() (list []Params, err error) {
 	defer m.Reset()
-	rawQuery := m.buildSql()
+	rawQuery, err := m.buildSql()
+	if err != nil {
+		return []Params{}, err
+	}
 	list, err = m.queryValues(rawQuery, true)
 	if err != nil {
 		list = []Params{}
@@ -444,10 +300,13 @@ func (m *db) Select() (list []Params, err error) {
 // 示例：
 //
 //	user, err := msql.Model("users").Where("id", "=", "1").Find()
-func (m *db) Find() (Params, error) {
+func (m *Builder) Find() (Params, error) {
 	defer m.Reset()
 	m.Limit(1)
-	rawQuery := m.buildSql()
+	rawQuery, err := m.buildSql()
+	if err != nil {
+		return Params{}, err
+	}
 	list, err := m.queryValues(rawQuery, true)
 	if err != nil {
 		return Params{}, err
@@ -467,13 +326,16 @@ func (m *db) Find() (Params, error) {
 // 示例：
 //
 //	name, err := msql.Model("users").Where("id", "=", "1").Value("name")
-func (m *db) Value(field string) (string, error) {
+func (m *Builder) Value(field string) (string, error) {
 	defer m.Reset()
 	m.field = nil
 	m.fieldArgs = nil
 	m.Field(field)
 	m.Limit(1)
-	rawQuery := m.buildSql()
+	rawQuery, err := m.buildSql()
+	if err != nil {
+		return "", err
+	}
 	list, err := m.queryValues(rawQuery, true)
 	if err != nil {
 		return "", err
@@ -494,36 +356,26 @@ func (m *db) Value(field string) (string, error) {
 	return "", nil
 }
 
-// Sum 查询字段求和结果。
+// Count 统计当前条件下的记录数。
 //
-// field 仅接收字段或表达式文本，不支持占位符绑定；底层会调用 Value。
-func (m *db) Sum(field string) (string, error) {
-	field = "sum(" + field + ")"
-	return m.Value(field)
-}
-
-// Min 查询字段最小值。
-//
-// field 仅接收字段或表达式文本，不支持占位符绑定；底层会调用 Value。
-func (m *db) Min(field string) (string, error) {
-	field = "min(" + field + ")"
-	return m.Value(field)
-}
-
-// Max 查询字段最大值。
-//
-// field 仅接收字段或表达式文本，不支持占位符绑定；底层会调用 Value。
-func (m *db) Max(field string) (string, error) {
-	field = "max(" + field + ")"
-	return m.Value(field)
-}
-
-// Avg 查询字段平均值。
-//
-// field 仅接收字段或表达式文本，不支持占位符绑定；底层会调用 Value。
-func (m *db) Avg(field string) (string, error) {
-	field = "avg(" + field + ")"
-	return m.Value(field)
+// field 为空时使用 *；存在 group by 时会自动包一层子查询统计分组数量。
+// field 仅接收字段或表达式文本，不支持占位符绑定；Count 也不会使用 Field(..., args...)
+// 中的字段表达式参数。需要绑定条件时请使用 Where、WhereRaw、Join 或 Having。
+func (m *Builder) Count(field ...string) (int, error) {
+	defer m.Reset()
+	if field == nil || len(field) == 0 {
+		field = []string{"*"}
+	}
+	rawQuery, err := m.buildCount(field[0])
+	if err != nil {
+		return 0, err
+	}
+	vs, e := m.queryValues(rawQuery, false)
+	if e != nil || len(vs) < 1 {
+		return 0, e
+	}
+	total, _ := strconv.Atoi(vs[0][`total`])
+	return total, e
 }
 
 // Paginate 按页查询数据，并返回总记录数。
@@ -533,7 +385,7 @@ func (m *db) Avg(field string) (string, error) {
 // 示例：
 //
 //	list, total, err := msql.Model("users").Where("status", "=", "enabled").Paginate(1, 20)
-func (m *db) Paginate(page, limit int) (list []Params, total int, err error) {
+func (m *Builder) Paginate(page, limit int) (list []Params, total int, err error) {
 	defer m.Reset()
 	if page < 1 {
 		page = 1
@@ -547,7 +399,11 @@ func (m *db) Paginate(page, limit int) (list []Params, total int, err error) {
 		list = []Params{}
 		return
 	}
-	rawQuery := m.buildSql()
+	rawQuery, err := m.buildSql()
+	if err != nil {
+		list = []Params{}
+		return
+	}
 	list, err = m.queryValues(rawQuery, true)
 	if err != nil {
 		list = []Params{}
@@ -555,16 +411,53 @@ func (m *db) Paginate(page, limit int) (list []Params, total int, err error) {
 	return
 }
 
+// Sum 查询字段求和结果。
+//
+// field 仅接收字段或表达式文本，不支持占位符绑定；底层会调用 Value。
+func (m *Builder) Sum(field string) (string, error) {
+	field = "sum(" + field + ")"
+	return m.Value(field)
+}
+
+// Min 查询字段最小值。
+//
+// field 仅接收字段或表达式文本，不支持占位符绑定；底层会调用 Value。
+func (m *Builder) Min(field string) (string, error) {
+	field = "min(" + field + ")"
+	return m.Value(field)
+}
+
+// Max 查询字段最大值。
+//
+// field 仅接收字段或表达式文本，不支持占位符绑定；底层会调用 Value。
+func (m *Builder) Max(field string) (string, error) {
+	field = "max(" + field + ")"
+	return m.Value(field)
+}
+
+// Avg 查询字段平均值。
+//
+// field 仅接收字段或表达式文本，不支持占位符绑定；底层会调用 Value。
+func (m *Builder) Avg(field string) (string, error) {
+	field = "avg(" + field + ")"
+	return m.Value(field)
+}
+
 // ColumnArr 查询单列数据，并按顺序返回字符串切片。
+//
+// field 可以是字段名或带别名的表达式，返回值会使用 GetAsField 解析出的结果字段。
 //
 // 示例：
 //
 //	ids, err := msql.Model("users").ColumnArr("id")
-func (m *db) ColumnArr(field string) (array []string, err error) {
+func (m *Builder) ColumnArr(field string) (array []string, err error) {
 	defer m.Reset()
 	m.Field(field)
 	array = []string{}
-	rawQuery := m.buildSql()
+	rawQuery, err := m.buildSql()
+	if err != nil {
+		return array, err
+	}
 	l, e := m.queryValues(rawQuery, true)
 	if e != nil {
 		return array, e
@@ -582,16 +475,20 @@ func (m *db) ColumnArr(field string) (array []string, err error) {
 // ColumnObj 查询两列数据，并返回 key 到 field 的映射。
 //
 // field 是值字段，key 是键字段。
+// 两个参数都会追加到 select 字段列表，并通过 GetAsField 解析结果字段名。
 //
 // 示例：
 //
 //	names, err := msql.Model("users").ColumnObj("name", "id")
-func (m *db) ColumnObj(field, key string) (object Params, err error) {
+func (m *Builder) ColumnObj(field, key string) (object Params, err error) {
 	defer m.Reset()
 	m.Field(field)
 	m.Field(key)
 	object = Params{}
-	rawQuery := m.buildSql()
+	rawQuery, err := m.buildSql()
+	if err != nil {
+		return object, err
+	}
 	l, e := m.queryValues(rawQuery, true)
 	if e != nil {
 		return object, e
@@ -609,15 +506,20 @@ func (m *db) ColumnObj(field, key string) (object Params, err error) {
 
 // ColumnMap 查询多行数据，并按 key 字段值映射到整行数据。
 //
+// field 会原样追加到 select 字段列表，key 会额外追加用于构造返回 map 的键。
+//
 // 示例：
 //
 //	users, err := msql.Model("users").ColumnMap("id,name", "id")
-func (m *db) ColumnMap(field, key string) (list Column, err error) {
+func (m *Builder) ColumnMap(field, key string) (list Column, err error) {
 	defer m.Reset()
 	m.Field(field)
 	m.Field(key)
 	list = Column{}
-	rawQuery := m.buildSql()
+	rawQuery, err := m.buildSql()
+	if err != nil {
+		return list, err
+	}
 	l, e := m.queryValues(rawQuery, true)
 	if e != nil {
 		return list, e
@@ -641,7 +543,11 @@ func (m *db) ColumnMap(field, key string) (list Column, err error) {
 //
 //	id, err := msql.Model("users").Insert(msql.Datas{"name": "tom", "status": "enabled"})
 //	id, err = msql.Model("users", "pg").Insert(msql.Datas{"name": "tom"}, "id")
-func (m *db) Insert(data Datas, returning ...string) (int64, error) {
+func (m *Builder) Insert(data Datas, returning ...string) (int64, error) {
+	table, err := m.tableName()
+	if err != nil {
+		return 0, err
+	}
 	if len(data) < 1 {
 		return 0, errors.New("insert data cannot be null")
 	}
@@ -655,13 +561,13 @@ func (m *db) Insert(data Datas, returning ...string) (int64, error) {
 		seats[index] = getSeatStr(m.name, index)
 		values[index] = data[k]
 	}
-	query := "insert into " + ToField(m.table) + " (" + strings.Join(fields, ", ") +
+	query := "insert into " + table + " (" + strings.Join(fields, ", ") +
 		") values (" + strings.Join(seats, ", ") + ")"
-	if len(returning) > 0 { // 兼容postgres
+	if len(returning) > 0 { // 兼容 PostgreSQL returning。
 		query += fmt.Sprintf(` RETURNING %s`, strings.Join(returning, `,`))
 	}
 	m.lastsql = renderDebugParamSeats(query, values)
-	if len(returning) > 0 { // 兼容postgres
+	if len(returning) > 0 { // 兼容 PostgreSQL returning。
 		if vs, err := RawValues(m.name, query, m.tx, values...); err == nil {
 			if len(vs) > 0 {
 				m.lastid, _ = strconv.ParseInt(vs[0][returning[0]], 10, 64)
@@ -695,7 +601,11 @@ func (m *db) Insert(data Datas, returning ...string) (int64, error) {
 //	rows, err := msql.Model("users").
 //	    Where("id", "=", "1").
 //	    Update(msql.Datas{"name": "tom"})
-func (m *db) Update(data Datas) (int64, error) {
+func (m *Builder) Update(data Datas) (int64, error) {
+	table, err := m.tableName()
+	if err != nil {
+		return 0, err
+	}
 	if len(data) < 1 {
 		return 0, errors.New("update data cannot be null")
 	}
@@ -710,7 +620,7 @@ func (m *db) Update(data Datas) (int64, error) {
 		fields[index] = ToField(k) + " = " + getSeatStr(m.name, index)
 		values[index] = data[k]
 	}
-	query := "update " + ToField(m.table) + " set " +
+	query := "update " + table + " set " +
 		strings.Join(fields, ", ") + " " + where
 	query = renderParamSeats(m.name, query, 0)
 	whereArgs := m.getWhereArgs()
@@ -722,6 +632,8 @@ func (m *db) Update(data Datas) (int64, error) {
 //
 // sqlraw 会原样拼接到 set 后面，调用方需保证内容可信；args 会在 where 条件参数之前传入。
 // PostgreSQL raw 片段需要使用 $1、$2 等占位符；? 会按 SQL 原文保留，可用于 JSONB 运算符。
+// $n 仅表示一个待绑定参数位置，不表示参数复用；每出现一个 $n 就必须按出现顺序传入一个有实际意义的参数。
+// 构造可执行 SQL 时包内会按最终 SQL 出现顺序重新编号这些 PostgreSQL 占位符。
 // Update2 同样要求必须存在 where 条件。
 //
 // 示例：
@@ -729,7 +641,11 @@ func (m *db) Update(data Datas) (int64, error) {
 //	rows, err := msql.Model("users").Where("id", "=", "1").Update2("login_count=login_count+1")
 //	rows, err = msql.Model("users").Where("id", "=", "1").Update2("score=?", 100)
 //	rows, err = msql.Model("users", "pg").Where("id", "=", "1").Update2("score=$1", 100)
-func (m *db) Update2(sqlraw string, args ...any) (int64, error) {
+func (m *Builder) Update2(sqlraw string, args ...any) (int64, error) {
+	table, err := m.tableName()
+	if err != nil {
+		return 0, err
+	}
 	if sqlraw == "" {
 		return 0, errors.New("update data cannot be null")
 	}
@@ -738,7 +654,7 @@ func (m *db) Update2(sqlraw string, args ...any) (int64, error) {
 		return 0, errors.New("where condition cannot be null")
 	}
 	defer m.Reset()
-	query := "update " + ToField(m.table) + " set " + sqlraw + " " + where
+	query := "update " + table + " set " + sqlraw + " " + where
 	query = renderParamSeats(m.name, query, 0)
 	whereArgs := m.getWhereArgs()
 	execArgs := make([]any, 0, len(args)+len(whereArgs))
@@ -754,23 +670,29 @@ func (m *db) Update2(sqlraw string, args ...any) (int64, error) {
 // 示例：
 //
 //	rows, err := msql.Model("users").Where("id", "=", "1").Delete()
-func (m *db) Delete() (int64, error) {
+func (m *Builder) Delete() (int64, error) {
+	table, err := m.tableName()
+	if err != nil {
+		return 0, err
+	}
 	where := m.getWhere()
 	if where == "" {
 		return 0, errors.New("where condition cannot be null")
 	}
 	defer m.Reset()
-	query := "delete from " + ToField(m.table) + " " + where
+	query := "delete from " + table + " " + where
 	query = renderParamSeats(m.name, query, 0)
 	args := m.getWhereArgs()
 	return m.execRowsAffected(query, args)
 }
 
-// TableExists 判断当前模型指定的表是否存在。
-func (m *db) TableExists() (bool, error) {
-	tableName := ToField(m.table)
-	if tableName == "" {
-		return false, errors.New("the table name cannot be empty")
+// TableExists 判断当前 Builder 指定的表是否存在。
+//
+// MySQL 使用 show tables like 查询，PostgreSQL 使用当前 schema 下的 information_schema。
+func (m *Builder) TableExists() (bool, error) {
+	tableName, err := m.tableName()
+	if err != nil {
+		return false, err
 	}
 
 	var (
@@ -807,10 +729,12 @@ func (m *db) TableExists() (bool, error) {
 }
 
 // FieldExists 判断当前表中指定字段是否存在。
-func (m *db) FieldExists(field string) (bool, error) {
-	table := ToField(m.table)
-	if table == "" {
-		return false, errors.New("the table name cannot be empty")
+//
+// MySQL 使用 describe 查询，PostgreSQL 使用当前 schema 下的 information_schema。
+func (m *Builder) FieldExists(field string) (bool, error) {
+	table, err := m.tableName()
+	if err != nil {
+		return false, err
 	}
 	field = ToField(field)
 	if field == "" {
@@ -844,10 +768,12 @@ func (m *db) FieldExists(field string) (bool, error) {
 }
 
 // IndexExists 判断当前表中指定索引是否存在。
-func (m *db) IndexExists(keyname string) (bool, error) {
-	table := ToField(m.table)
-	if table == "" {
-		return false, errors.New("the table name cannot be empty")
+//
+// MySQL 使用 show index 查询，PostgreSQL 使用当前 schema 下的 pg_indexes。
+func (m *Builder) IndexExists(keyname string) (bool, error) {
+	table, err := m.tableName()
+	if err != nil {
+		return false, err
 	}
 	if keyname == "" {
 		return false, errors.New("the index name cannot be empty")
@@ -885,10 +811,12 @@ func (m *db) IndexExists(keyname string) (bool, error) {
 }
 
 // GetFields 查询当前表的字段名列表。
-func (m *db) GetFields() ([]string, error) {
-	table := ToField(m.table)
-	if table == "" {
-		return nil, errors.New("the table name cannot be empty")
+//
+// MySQL 使用 describe 查询，PostgreSQL 使用当前 schema 下的 information_schema，并按字段顺序返回。
+func (m *Builder) GetFields() ([]string, error) {
+	table, err := m.tableName()
+	if err != nil {
+		return nil, err
 	}
 
 	var (
@@ -922,16 +850,9 @@ func (m *db) GetFields() ([]string, error) {
 	return fields, nil
 }
 
-var (
-	// TxE0 表示事务尚未开始或已经结束。
-	TxE0 = errors.New("transaction not begin")
-	// TxE1 表示事务已经开始，不能重复开启。
-	TxE1 = errors.New("transaction already begin")
-)
-
-// Begin 在当前模型上开启事务。
+// Begin 在当前 Builder 上开启事务。
 //
-// 开启事务后，当前模型的后续查询和写入会使用同一个事务连接，直到 Commit 或 Rollback。
+// 开启事务后，当前 Builder 的后续查询和写入会使用同一个事务连接，直到 Commit 或 Rollback。
 //
 // 示例：
 //
@@ -940,7 +861,7 @@ var (
 //	_, err := m.Where("id", "=", "1").Update(msql.Datas{"name": "tom"})
 //	if err != nil { _ = m.Rollback(); return err }
 //	err = m.Commit()
-func (m *db) Begin() error {
+func (m *Builder) Begin() error {
 	if m.istx {
 		return TxE1
 	}
@@ -952,8 +873,8 @@ func (m *db) Begin() error {
 	return err
 }
 
-// Commit 提交当前模型上的事务。
-func (m *db) Commit() error {
+// Commit 提交当前 Builder 上的事务。
+func (m *Builder) Commit() error {
 	if !m.istx || m.tx == nil {
 		return TxE0
 	}
@@ -966,8 +887,8 @@ func (m *db) Commit() error {
 	return err
 }
 
-// Rollback 回滚当前模型上的事务。
-func (m *db) Rollback() error {
+// Rollback 回滚当前 Builder 上的事务。
+func (m *Builder) Rollback() error {
 	if !m.istx || m.tx == nil {
 		return TxE0
 	}

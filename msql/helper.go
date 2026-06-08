@@ -10,15 +10,264 @@ import (
 	"time"
 )
 
-// InArray 判断 needle 是否存在于 haystack 中。
-// haystack 为 nil 或空切片时返回 false。
-func InArray[T comparable](needle T, haystack []T) bool {
-	for idx := range haystack {
-		if haystack[idx] == needle {
-			return true
-		}
+// getDB 获取已注册的数据库配置。
+//
+// name 为空时使用 default 连接。
+func getDB(name string) (alias *dataBase, err error) {
+	if alias, ok := lookupDataBase(name); ok && alias != nil {
+		return alias, nil
 	}
-	return false
+	return nil, errors.New("the database alias does not exist")
+}
+
+// getExecDB 获取执行 SQL 所需的连接池，并按别名配置输出调试日志。
+//
+// RawValues 和 RawExec 都需要在执行前完成别名查找、连接空值检查和 debug 日志输出，
+// 该方法用于保持这两条执行路径的前置逻辑一致。
+func getExecDB(name, query string, tx *sql.Tx, args []any) (*sql.DB, error) {
+	alias, err := getDB(name)
+	if err != nil {
+		return nil, err
+	}
+	aliasName, db, dev := aliasSnapshot(alias)
+	if db == nil {
+		return nil, errors.New("the database connection does not exist")
+	}
+	if dev {
+		fmt.Println(formatSQLLog(aliasName, time.Now(), tx != nil, query, args))
+	}
+	return db, nil
+}
+
+// queryValues 执行由 Builder 构造出的查询 SQL，并同步记录调试 SQL。
+//
+// rawQuery 保留内部占位符，方法内部会按当前数据库驱动渲染为可执行 SQL；
+// withField 用于控制 count 场景是否跳过字段表达式参数。
+func (m *Builder) queryValues(rawQuery string, withField bool) ([]Params, error) {
+	query := renderParamSeats(m.name, rawQuery, 0)
+	args := m.getQueryArgs(withField)
+	m.lastsql = renderDebugParamSeats(rawQuery, args)
+	return RawValues(m.name, query, m.tx, args...)
+}
+
+// rawValues 执行已经构造完成的原始查询 SQL，并同步记录调试 SQL。
+//
+// 例如 TableExists、FieldExists 这类元信息查询会自行按数据库类型生成 SQL，
+// 不再经过 buildSql，因此直接使用该方法执行。
+func (m *Builder) rawValues(query string, args []any) ([]Params, error) {
+	m.lastsql = renderDebugParamSeats(query, args)
+	return RawValues(m.name, query, m.tx, args...)
+}
+
+// execRowsAffected 执行写入 SQL，并把影响行数保存到当前 Builder。
+//
+// Update、Update2 和 Delete 都只关心 RawExec 的 RowsAffected 结果，
+// 该方法用于统一 lastsql 记录、执行和 affect 更新逻辑。
+func (m *Builder) execRowsAffected(query string, args []any) (int64, error) {
+	m.affect = 0
+	m.lastsql = renderDebugParamSeats(query, args)
+	ret, err := RawExec(m.name, query, m.tx, args...)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := ret.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	m.affect = rows
+	return rows, nil
+}
+
+// getFields 生成 select 字段列表。
+//
+// 未指定字段时返回 *。
+func (m *Builder) getFields() string {
+	if len(m.field) == 0 {
+		return "*"
+	}
+	return strings.Join(m.field, ",")
+}
+
+// tableName 返回当前 Builder 的有效表名。
+//
+// 表名会复用 ToField 的清理规则；空 Builder、零值 Builder 或仅包含空白/引号的表名都会返回错误。
+func (m *Builder) tableName() (string, error) {
+	if m == nil {
+		return "", errEmptyTableName
+	}
+	table := ToField(m.table)
+	if table == "" {
+		return "", errEmptyTableName
+	}
+	return table, nil
+}
+
+// getQueryArgs 按最终 SQL 出现顺序返回查询绑定参数。
+//
+// withField 为 false 时不包含字段表达式参数，主要用于 count 查询。
+func (m *Builder) getQueryArgs(withField bool) []any {
+	capacity := len(m.joinArgs) + len(m.whereArgs) + len(m.whereorArgs) + len(m.havingArgs)
+	if withField {
+		capacity += len(m.fieldArgs)
+	}
+	args := make([]any, 0, capacity)
+	if withField {
+		args = append(args, m.fieldArgs...)
+	}
+	args = append(args, m.joinArgs...)
+	args = append(args, m.whereArgs...)
+	args = append(args, m.whereorArgs...)
+	args = append(args, m.havingArgs...)
+	return args
+}
+
+// getLimit 生成 limit 和 offset 子句。
+func (m *Builder) getLimit() string {
+	if m.limit < 1 {
+		return ""
+	}
+	s := "limit " + strconv.Itoa(m.limit)
+	if m.offset > 0 {
+		s += " offset " + strconv.Itoa(m.offset)
+	}
+	return s
+}
+
+// getGroups 生成 group by 子句。
+func (m *Builder) getGroups() string {
+	groups := strings.Join(m.group, ",")
+	if groups == "" {
+		return ""
+	}
+	return "group by " + groups
+}
+
+// getHavings 生成 having 子句。
+func (m *Builder) getHavings() string {
+	havings := strings.Join(m.having, " and ")
+	if havings == "" {
+		return ""
+	}
+	return "having " + havings
+}
+
+// getOrders 生成 order by 子句。
+func (m *Builder) getOrders() string {
+	orders := strings.Join(m.order, ",")
+	if orders == "" {
+		return ""
+	}
+	return "order by " + orders
+}
+
+// joinSQLParts 过滤空 SQL 片段后用单空格拼接，避免构造出的 SQL 出现多余空格。
+func joinSQLParts(parts ...string) string {
+	sl := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		sl = append(sl, part)
+	}
+	return strings.Join(sl, " ")
+}
+
+// buildSql 生成未渲染占位符的 select SQL。
+//
+// 返回值仍包含内部占位符，执行前需要通过 renderParamSeats 转换。
+func (m *Builder) buildSql() (string, error) {
+	table, err := m.tableName()
+	if err != nil {
+		return "", err
+	}
+	return joinSQLParts(
+		"select",
+		m.getFields(),
+		"from",
+		table,
+		m.alias,
+		joinSQLParts(m.join...),
+		m.getWhere(),
+		m.getGroups(),
+		m.getHavings(),
+		m.getOrders(),
+		m.getLimit(),
+	), nil
+}
+
+// buildCount 生成当前条件对应的 count SQL。
+//
+// 存在 group by 时会包装为子查询后再统计总数。
+func (m *Builder) buildCount(field string) (string, error) {
+	table, err := m.tableName()
+	if err != nil {
+		return "", err
+	}
+	if field == "" {
+		field = "*"
+	}
+	group := m.getGroups()
+	query := joinSQLParts(
+		"select",
+		"count("+field+") total",
+		"from",
+		table,
+		m.alias,
+		joinSQLParts(m.join...),
+		m.getWhere(),
+		group,
+		m.getHavings(),
+	)
+	if group != "" {
+		//noinspection SqlDialectInspection
+		query = "select count(*) total from (" + query + ") gc"
+	}
+	query += " limit 1"
+	return query, nil
+}
+
+// pageCount 查询分页场景下的总记录数。
+//
+// count 查询失败时保留错误返回给 Paginate，避免把数据库错误误表现为 total=0。
+func (m *Builder) pageCount() (int, error) {
+	rawQuery, err := m.buildCount("*")
+	if err != nil {
+		return 0, err
+	}
+	vs, e := m.queryValues(rawQuery, false)
+	if e != nil {
+		return 0, e
+	}
+	if len(vs) < 1 {
+		return 0, nil
+	}
+	total, _ := strconv.Atoi(vs[0][`total`])
+	return total, nil
+}
+
+// normalizeResultField 规范化结果字段名，兼容表别名限定字段和反引号包裹字段。
+func normalizeResultField(field string) string {
+	field = ToField(field)
+	if field == "" || strings.ContainsAny(field, "()") {
+		return field
+	}
+	if index := strings.LastIndex(field, "."); index >= 0 && index < len(field)-1 {
+		return ToField(field[index+1:])
+	}
+	return field
+}
+
+// sortedDataKeys 返回 Datas 中按字典序排列的字段名。
+//
+// Insert 和 Update 使用稳定字段顺序拼接 SQL，便于日志比对、测试断言和数据库执行计划复用。
+func sortedDataKeys(data Datas) []string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // sqlOpen 根据数据库配置打开连接并初始化连接池参数。
@@ -41,22 +290,6 @@ func sqlOpen(alias *dataBase, driverName ...string) error {
 	db.SetMaxIdleConns(alias.idle)
 	alias.db = db
 	return nil
-}
-
-// getSeatStr 根据连接驱动返回当前参数位置的占位符。
-//
-// MySQL 使用 ?，PostgreSQL 使用 $1、$2 形式。
-func getSeatStr(name string, index int) string {
-	alias, ok := lookupDataBase(name)
-	if ok && alias != nil {
-		alias.mu.RLock()
-		driver := alias.driver
-		alias.mu.RUnlock()
-		if driver == DriverPostgres {
-			return fmt.Sprintf(`$%d`, index+1)
-		}
-	}
-	return "?"
 }
 
 // lookupDataBase 返回指定别名当前注册的数据库配置。
@@ -205,7 +438,27 @@ func isPostgresDriver(alias *dataBase) bool {
 	return alias.driver == DriverPostgres
 }
 
-// renderParamSeats 将内部占位符渲染成当前数据库驱动可执行的占位符。
+// getSeatStr 根据连接驱动返回当前参数位置的占位符。
+//
+// MySQL 使用 ?，PostgreSQL 使用 $1、$2 形式。
+func getSeatStr(name string, index int) string {
+	alias, ok := lookupDataBase(name)
+	if ok && alias != nil {
+		alias.mu.RLock()
+		driver := alias.driver
+		alias.mu.RUnlock()
+		if driver == DriverPostgres {
+			return fmt.Sprintf(`$%d`, index+1)
+		}
+	}
+	return "?"
+}
+
+// renderParamSeats 将 SQL 中的占位符渲染成当前数据库驱动可执行的占位符。
+//
+// MySQL 只会替换包内临时占位符；PostgreSQL 会按最终 SQL 出现顺序重新编号包内临时占位符和已有 $n 占位符。
+// PostgreSQL raw 片段中的 $n 仅表示一个待绑定参数位置，不表示参数复用；每出现一个 $n 就必须有一个对应参数。
+// 普通 ? 在 PostgreSQL 下会保留原文，避免误改 JSONB 等 SQL 运算符。
 func renderParamSeats(name, query string, start int) string {
 	if !strings.Contains(query, paramSeat) {
 		if isPostgres(name) {
@@ -226,6 +479,8 @@ func renderParamSeats(name, query string, start int) string {
 
 // renderDebugParamSeats 将 SQL 中的占位符按参数渲染为调试展示字符串。
 //
+// 包内临时占位符、MySQL ? 和 PostgreSQL $n 都会按出现顺序消耗 args；
+// 字符串、标识符、注释和 PostgreSQL dollar-quoted 字符串里的占位符文本会保留原文。
 // 返回值仅用于日志或调试，不用于执行 SQL。
 func renderDebugParamSeats(query string, args []any) string {
 	var builder strings.Builder
@@ -266,6 +521,7 @@ func isPostgres(name string) bool {
 // renderPostgresParamSeats 将 SQL 中的内部占位符或旧 $n 占位符重新编号为 PostgreSQL 占位符。
 //
 // 嵌套子查询已经带有 $1、$2 时，会按最终 SQL 出现顺序重新编号，避免与外层参数冲突。
+// $n 仅表示一个待绑定参数位置，不表示参数复用；每出现一个 $n 就必须有一个对应参数。
 func renderPostgresParamSeats(query string, start int) string {
 	var builder strings.Builder
 	builder.Grow(len(query))
@@ -518,7 +774,7 @@ func formatSQLLog(name string, now time.Time, inTx bool, query string, args []an
 	return formatSQLLogWithTable(name, now, inTx, query, "", false, args)
 }
 
-// formatSQLTxBoundaryLog 生成事务边界的 SQL 调试日志，并附带当前模型表名。
+// formatSQLTxBoundaryLog 生成事务边界的 SQL 调试日志，并附带当前 Builder 表名。
 func formatSQLTxBoundaryLog(name string, now time.Time, query, table string) string {
 	return formatSQLLogWithTable(name, now, true, query, table, true, nil)
 }
@@ -642,348 +898,4 @@ func truncateSQLLogString(s string, maxRunes int) string {
 		return s
 	}
 	return string(runes[:maxRunes]) + "..."
-}
-
-// getDB 获取已注册的数据库配置。
-//
-// name 为空时使用 default 连接。
-func getDB(name string) (alias *dataBase, err error) {
-	if alias, ok := lookupDataBase(name); ok && alias != nil {
-		return alias, nil
-	}
-	return nil, errors.New("the database alias does not exist")
-}
-
-// getExecDB 获取执行 SQL 所需的连接池，并按别名配置输出调试日志。
-//
-// RawValues 和 RawExec 都需要在执行前完成别名查找、连接空值检查和 debug 日志输出，
-// 该方法用于保持这两条执行路径的前置逻辑一致。
-func getExecDB(name, query string, tx *sql.Tx, args []any) (*sql.DB, error) {
-	alias, err := getDB(name)
-	if err != nil {
-		return nil, err
-	}
-	aliasName, db, dev := aliasSnapshot(alias)
-	if db == nil {
-		return nil, errors.New("the database connection does not exist")
-	}
-	if dev {
-		fmt.Println(formatSQLLog(aliasName, time.Now(), tx != nil, query, args))
-	}
-	return db, nil
-}
-
-// toWhereValue 保留 where 条件绑定值原文。
-func toWhereValue(s string) string {
-	return s
-}
-
-// toWhere 将 Where/WhereOr 的字符串参数转换为 SQL 条件和绑定参数。
-//
-// 三段式条件会转换为占位符表达式，单参数条件会按原始 SQL 片段处理。
-func toWhere(a []string) (string, []any) {
-	if a == nil || len(a) < 1 || a[0] == "" {
-		return "", nil
-	}
-	if len(a) == 1 {
-		return a[0], nil
-	}
-	field := a[0]
-	operator := ""
-	value := ""
-	var args []any
-	switch len(a) {
-	case 2:
-		if a[0] == "" {
-			return a[1], nil
-		}
-		operator = "="
-		value = paramSeat
-		args = append(args, toWhereValue(a[1]))
-	case 3:
-		switch {
-		case strings.EqualFold(a[1], "in") ||
-			strings.EqualFold(a[1], "not in"):
-			values := strings.Split(a[2], ",")
-			if len(values) == 0 {
-				return "", nil
-			}
-			seats := make([]string, len(values))
-			for i, v := range values {
-				seats[i] = paramSeat
-				args = append(args, toWhereValue(strings.TrimSpace(v)))
-			}
-			operator = " " + a[1]
-			value = "(" + strings.Join(seats, ",") + ")"
-		case strings.EqualFold(a[1], "like") ||
-			strings.EqualFold(a[1], "not like"):
-			operator = " " + a[1] + " "
-			value = paramSeat
-			args = append(args, "%"+a[2]+"%")
-		case strings.EqualFold(a[1], "between") ||
-			strings.EqualFold(a[1], "not between"):
-			bs := strings.Split(a[2], ",")
-			if len(bs) != 2 {
-				return "", nil
-			}
-			operator = " " + a[1] + " "
-			value = paramSeat + " and " + paramSeat
-			args = append(args, toWhereValue(strings.TrimSpace(bs[0])), toWhereValue(strings.TrimSpace(bs[1])))
-		case InArray(a[1], []string{">", ">=", "<", "<=", "!=", "<>", "="}):
-			operator = a[1]
-			value = paramSeat
-			args = append(args, toWhereValue(a[2]))
-		case strings.EqualFold(a[0], "find_in_set"):
-			if a[1] == "" || a[2] == "" {
-				return "", nil
-			}
-			return "find_in_set(" + paramSeat + "," + a[2] + ")", []any{toWhereValue(a[1])}
-		default:
-			return "", nil
-		}
-	default:
-		return "", nil
-	}
-	fs := strings.Split(field, "|")
-	if len(fs) > 1 {
-		allArgs := make([]any, 0, len(fs)*len(args))
-		for i, f := range fs {
-			fs[i] = f + operator + value
-			allArgs = append(allArgs, args...)
-		}
-		return "(" + strings.Join(fs, " or ") + ")", allArgs
-	}
-	return field + operator + value, args
-}
-
-// normalizeResultField 规范化结果字段名，兼容表别名限定字段和反引号包裹字段。
-func normalizeResultField(field string) string {
-	field = ToField(field)
-	if field == "" || strings.ContainsAny(field, "()") {
-		return field
-	}
-	if index := strings.LastIndex(field, "."); index >= 0 && index < len(field)-1 {
-		return ToField(field[index+1:])
-	}
-	return field
-}
-
-// getFields 生成 select 字段列表。
-//
-// 未指定字段时返回 *。
-func (m *db) getFields() string {
-	if len(m.field) == 0 {
-		return "*"
-	}
-	return strings.Join(m.field, ",")
-}
-
-// getWhere 生成 where 子句。
-//
-// where 条件使用 and 连接，whereor 条件使用 or 连接。
-func (m *db) getWhere() string {
-	wh := strings.Join(m.where, " and ")
-	or := strings.Join(m.whereor, " or ")
-	if wh == "" {
-		if or == "" {
-			return ""
-		}
-		return "where " + or
-	}
-	if or == "" {
-		return "where " + wh
-	}
-	return "where " + wh + " or " + or
-}
-
-// getWhereArgs 返回 where 和 whereor 条件的绑定参数。
-func (m *db) getWhereArgs() []any {
-	args := make([]any, 0, len(m.whereArgs)+len(m.whereorArgs))
-	args = append(args, m.whereArgs...)
-	args = append(args, m.whereorArgs...)
-	return args
-}
-
-// getQueryArgs 按最终 SQL 出现顺序返回查询绑定参数。
-//
-// withField 为 false 时不包含字段表达式参数，主要用于 count 查询。
-func (m *db) getQueryArgs(withField bool) []any {
-	capacity := len(m.joinArgs) + len(m.whereArgs) + len(m.whereorArgs) + len(m.havingArgs)
-	if withField {
-		capacity += len(m.fieldArgs)
-	}
-	args := make([]any, 0, capacity)
-	if withField {
-		args = append(args, m.fieldArgs...)
-	}
-	args = append(args, m.joinArgs...)
-	args = append(args, m.whereArgs...)
-	args = append(args, m.whereorArgs...)
-	args = append(args, m.havingArgs...)
-	return args
-}
-
-// queryValues 执行由模型构造出的查询 SQL，并同步记录调试 SQL。
-//
-// rawQuery 保留内部占位符，方法内部会按当前数据库驱动渲染为可执行 SQL；
-// withField 用于控制 count 场景是否跳过字段表达式参数。
-func (m *db) queryValues(rawQuery string, withField bool) ([]Params, error) {
-	query := renderParamSeats(m.name, rawQuery, 0)
-	args := m.getQueryArgs(withField)
-	m.lastsql = renderDebugParamSeats(rawQuery, args)
-	return RawValues(m.name, query, m.tx, args...)
-}
-
-// rawValues 执行已经构造完成的原始查询 SQL，并同步记录调试 SQL。
-//
-// 例如 TableExists、FieldExists 这类元信息查询会自行按数据库类型生成 SQL，
-// 不再经过 buildSql，因此直接使用该方法执行。
-func (m *db) rawValues(query string, args []any) ([]Params, error) {
-	m.lastsql = renderDebugParamSeats(query, args)
-	return RawValues(m.name, query, m.tx, args...)
-}
-
-// execRowsAffected 执行写入 SQL，并把影响行数保存到当前模型。
-//
-// Update、Update2 和 Delete 都只关心 RawExec 的 RowsAffected 结果，
-// 该方法用于统一 lastsql 记录、执行和 affect 更新逻辑。
-func (m *db) execRowsAffected(query string, args []any) (int64, error) {
-	m.affect = 0
-	m.lastsql = renderDebugParamSeats(query, args)
-	ret, err := RawExec(m.name, query, m.tx, args...)
-	if err != nil {
-		return 0, err
-	}
-	rows, err := ret.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	m.affect = rows
-	return rows, nil
-}
-
-// getLimit 生成 limit 和 offset 子句。
-func (m *db) getLimit() string {
-	if m.limit < 1 {
-		return ""
-	}
-	s := "limit " + strconv.Itoa(m.limit)
-	if m.offset > 0 {
-		s += " offset " + strconv.Itoa(m.offset)
-	}
-	return s
-}
-
-// getGroups 生成 group by 子句。
-func (m *db) getGroups() string {
-	groups := strings.Join(m.group, ",")
-	if groups == "" {
-		return ""
-	}
-	return "group by " + groups
-}
-
-// getHavings 生成 having 子句。
-func (m *db) getHavings() string {
-	havings := strings.Join(m.having, " and ")
-	if havings == "" {
-		return ""
-	}
-	return "having " + havings
-}
-
-// getOrders 生成 order by 子句。
-func (m *db) getOrders() string {
-	orders := strings.Join(m.order, ",")
-	if orders == "" {
-		return ""
-	}
-	return "order by " + orders
-}
-
-// joinSQLParts 过滤空 SQL 片段后用单空格拼接，避免构造出的 SQL 出现多余空格。
-func joinSQLParts(parts ...string) string {
-	sl := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		sl = append(sl, part)
-	}
-	return strings.Join(sl, " ")
-}
-
-// buildSql 生成未渲染占位符的 select SQL。
-//
-// 返回值仍包含内部占位符，执行前需要通过 renderParamSeats 转换。
-func (m *db) buildSql() string {
-	return joinSQLParts(
-		"select",
-		m.getFields(),
-		"from",
-		ToField(m.table),
-		m.alias,
-		joinSQLParts(m.join...),
-		m.getWhere(),
-		m.getGroups(),
-		m.getHavings(),
-		m.getOrders(),
-		m.getLimit(),
-	)
-}
-
-// buildCount 生成当前条件对应的 count SQL。
-//
-// 存在 group by 时会包装为子查询后再统计总数。
-func (m *db) buildCount(field string) string {
-	if field == "" {
-		field = "*"
-	}
-	group := m.getGroups()
-	query := joinSQLParts(
-		"select",
-		"count("+field+") total",
-		"from",
-		ToField(m.table),
-		m.alias,
-		joinSQLParts(m.join...),
-		m.getWhere(),
-		group,
-		m.getHavings(),
-	)
-	if group != "" {
-		//noinspection SqlDialectInspection
-		query = "select count(*) total from (" + query + ") gc"
-	}
-	query += " limit 1"
-	return query
-}
-
-// pageCount 查询分页场景下的总记录数。
-//
-// count 查询失败时保留错误返回给 Paginate，避免把数据库错误误表现为 total=0。
-func (m *db) pageCount() (int, error) {
-	rawQuery := m.buildCount("*")
-	vs, e := m.queryValues(rawQuery, false)
-	if e != nil {
-		return 0, e
-	}
-	if len(vs) < 1 {
-		return 0, nil
-	}
-	total, _ := strconv.Atoi(vs[0][`total`])
-	return total, nil
-}
-
-// sortedDataKeys 返回 Datas 中按字典序排列的字段名。
-//
-// Insert 和 Update 使用稳定字段顺序拼接 SQL，便于日志比对、测试断言和数据库执行计划复用。
-func sortedDataKeys(data Datas) []string {
-	keys := make([]string, 0, len(data))
-	for k := range data {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
