@@ -2,7 +2,6 @@ package msql
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -590,11 +589,45 @@ func formatSQLLogArg(arg any) string {
 	}
 }
 
-// quoteSQLLogString 将字符串截断后按 JSON 字符串规则转义。
+// quoteSQLLogString 将字符串截断后渲染为单行日志字段值。
 func quoteSQLLogString(s string, maxRunes int) string {
 	s = truncateSQLLogString(s, maxRunes)
-	b, _ := json.Marshal(s)
-	return string(b)
+	const hex = "0123456789abcdef"
+	var builder strings.Builder
+	builder.Grow(len(s) + 2)
+	builder.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			builder.WriteString(`\\`)
+		case '"':
+			builder.WriteString(`\"`)
+		case '\n':
+			builder.WriteString(`\n`)
+		case '\r':
+			builder.WriteString(`\r`)
+		case '\t':
+			builder.WriteString(`\t`)
+		case '\b':
+			builder.WriteString(`\b`)
+		case '\f':
+			builder.WriteString(`\f`)
+		case '\u2028':
+			builder.WriteString(`\u2028`)
+		case '\u2029':
+			builder.WriteString(`\u2029`)
+		default:
+			if r < ' ' || r == '\u007f' || (r >= '\u0080' && r <= '\u009f') {
+				builder.WriteString(`\u00`)
+				builder.WriteByte(hex[int(r)>>4])
+				builder.WriteByte(hex[int(r)&0x0f])
+				continue
+			}
+			builder.WriteRune(r)
+		}
+	}
+	builder.WriteByte('"')
+	return builder.String()
 }
 
 // truncateSQLLogString 按 rune 数截断字符串。
