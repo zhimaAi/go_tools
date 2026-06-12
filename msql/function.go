@@ -1,58 +1,26 @@
 package msql
 
-import (
-	"strings"
+import "strings"
 
-	"github.com/zhimaAi/go_tools/tool"
-)
-
-func TrimAdd(a ...string) (s string) {
-	n := len(a)
-	if n == 0 {
-		return
-	}
-	if a[0] != "" {
-		s = strings.TrimSpace(a[0])
-		s = strings.Trim(s, "`'\"\t ")
-		if n == 1 {
-			return
-		}
-		s = strings.Trim(s, a[1])
-	}
-	if n == 2 {
-		return
-	}
-	return a[2] + s + a[2]
-}
-
+// ToField 清理字段名或表名两侧的空白和引号。
 func ToField(s string) string {
-	return TrimAdd(s, "", "")
+	return strings.Trim(strings.TrimSpace(s), "`'\"\t ")
 }
 
+// ToString 将字符串清理后格式化为 SQL 字符串字面量。
+//
+// 该函数会先复用 ToField 去掉首尾空白和包裹引号，再按 SQL 字符串字面量规则包裹单引号并转义内部单引号。
 func ToString(s string) string {
-	return TrimAdd(s, "", "'")
+	return quoteSQLValueString(ToField(s))
 }
 
-func ToLike(s string) string {
-	return ToString(TrimAdd(s, "", "%"))
-}
-
-func Assemble(s string) string {
-	l := strings.Split(s, ",")
-	for i, v := range l {
-		l[i] = ToString(v)
+// InArray 判断 needle 是否存在于 haystack 中。
+// haystack 为 nil 或空切片时返回 false。
+func InArray[T comparable](needle T, haystack []T) bool {
+	for idx := range haystack {
+		if haystack[idx] == needle {
+			return true
+		}
 	}
-	return strings.Join(l, ",")
-}
-
-func GetLimitPage(query Params) (limit, page int) {
-	limit = tool.Intval(query["limit"])
-	if limit < 1 {
-		limit = 15
-	}
-	page = tool.Intval(query["page"])
-	if page < 1 {
-		page = 1
-	}
-	return
+	return false
 }
