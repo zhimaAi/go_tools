@@ -16,31 +16,21 @@ func String2IntArray(ids string) []int {
 	return arr
 }
 
-func InArray[Val comparable](a Val, b []Val) bool {
-	for i := range b {
-		if b[i] == a {
+func InArray[T comparable](needle T, haystack []T) bool {
+	for idx := range haystack {
+		if haystack[idx] == needle {
 			return true
 		}
 	}
 	return false
 }
 
-func InArrayInt(n int, h []int) bool {
-	for _, v := range h {
-		if v == n {
-			return true
-		}
-	}
-	return false
+func InArrayInt(needle int, haystack []int) bool {
+	return InArray(needle, haystack)
 }
 
-func InArrayString(n string, h []string) bool {
-	for _, v := range h {
-		if v == n {
-			return true
-		}
-	}
-	return false
+func InArrayString(needle string, haystack []string) bool {
+	return InArray(needle, haystack)
 }
 
 func Array2String(sl []string, glue string) (ss string) {
